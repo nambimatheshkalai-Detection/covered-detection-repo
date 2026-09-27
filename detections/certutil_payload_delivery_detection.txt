@@ -1,0 +1,20 @@
+// Detection for Certutil.exe abuse with -urlcache, -split, -f flags for payload delivery
+// MITRE: T1218.004 (System Binary Proxy Execution: Certutil), T1105 (Ingress Tool Transfer)
+let suspiciousFlags = dynamic(["-urlcache", "-split", "-f"]);
+DeviceProcessEvents
+| where FileName =~ "certutil.exe"
+| where ProcessCommandLine has_any (suspiciousFlags)
+| where ProcessCommandLine has_any ("http://", "https://", "ftp://")
+| extend ExtractedUrl = extract(@"(https?://[^\s"'<>]+|ftp://[^\s"'<>]+)", 1, ProcessCommandLine)
+| extend FlagCount = array_length(suspiciousFlags) - array_length(set_difference(suspiciousFlags, split(ProcessCommandLine, " ")))
+| where FlagCount >= 2
+| join kind=inner (
+    DeviceNetworkEvents
+    | where InitiatingProcessFileName =~ "certutil.exe"
+    | where RemotePort !in (53, 80, 443) or RemoteUrl has_any ("pastebin", "github", "raw.githubusercontent", "bit.ly", "tinyurl")
+    | project Timestamp, DeviceName, RemoteIP, RemoteUrl, RemotePort, InitiatingProcessCommandLine
+) on DeviceName, $left.Timestamp >= $right.Timestamp - 5m and $left.Timestamp <= $right.Timestamp + 5m
+| project Timestamp, DeviceName, AccountName, FileName, ProcessCommandLine, ExtractedUrl, RemoteIP, RemoteUrl, RemotePort, InitiatingProcessCommandLine
+| summarize min(Timestamp), max(Timestamp), make_set(ExtractedUrl), make_set(RemoteIP), make_set(RemoteUrl) by DeviceName, AccountName, ProcessCommandLine
+| extend AlertTime = min_Timestamp
+| project-away min_Timestamp, max_Timestamp
