@@ -1,0 +1,19 @@
+let GovDomains = dynamic(["gov", "gov.uk", "gov.au", "gov.ca", "gob.es", "gouv.fr", "bund.de", "go.jp", "gov.br", "gov.in"]);
+let SuspiciousSenderDomains = dynamic(["revolut.com", "revolutbank.com", "revolutpayments.com"]);
+EmailEvents
+| where Timestamp > ago(24h)
+| where SenderFromDomain has_any (GovDomains) or SenderFromDomain contains "government" or SenderFromDomain contains "official" or SenderFromDomain contains "law-enforcement"
+| where RecipientEmailDomain has_any (SuspiciousSenderDomains)
+| extend IsSpoofed = iff(SenderFromDomain !in (GovDomains) and (SenderFromDomain contains "gov" or SenderFromDomain contains "official"), true, false)
+| where IsSpoofed == true
+| join kind=inner (
+    IdentityLogonEvents
+    | where Timestamp > ago(24h)
+    | where Application == "Office365" or Application == "Azure AD"
+    | where ResultType == 0
+    | summarize LogonCount = count(), LogonLocations = make_set(Location), LogonTimes = make_set(Timestamp) by AccountUpn
+    | where LogonCount > 5 or array_length(LogonLocations) > 2
+) on $left.RecipientEmailAddress == $right.AccountUpn
+| project Timestamp, SenderFromDomain, SenderFromAddress, RecipientEmailAddress, Subject, IsSpoofed, LogonCount, LogonLocations, LogonTimes
+| extend MITRETechnique = "T1566.001"
+| extend RuleName = "SocialEngineering_FakeGovRequest_Detection"
