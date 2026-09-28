@@ -1,0 +1,39 @@
+let RansomwareIndicators = dynamic(["vssadmin.exe", "wmic.exe", "cipher.exe", "wbadmin.exe", "bcdedit.exe", "powershell.exe", "cmd.exe"]);
+let SuspiciousArgs = dynamic(["delete shadows", "shadowcopy delete", "resize shadowstorage", "recoveryenabled no", "bootstatuspolicy ignoreallfailures", "-enc", "-encodedcommand", "bypass", "hidden", "windowstyle hidden"]);
+SecurityEvent
+| where EventID == 4688
+| where ProcessName in~ (RansomwareIndicators) or CommandLine has_any (SuspiciousArgs)
+| extend RansomwareTechnique = case(
+    CommandLine has "delete shadows" or CommandLine has "shadowcopy delete", "T1490 - Inhibit System Recovery",
+    CommandLine has "recoveryenabled no" or CommandLine has "bootstatuspolicy ignoreallfailures", "T1490 - Inhibit System Recovery",
+    CommandLine has_any ("-enc", "-encodedcommand", "bypass", "hidden"), "T1059.001 - PowerShell",
+    "Suspicious Execution"
+)
+| where RansomwareTechnique != "Suspicious Execution"
+| summarize Count = count(), Computers = make_set(Computer), Accounts = make_set(Account), CommandLines = make_set(CommandLine) by Bin = bin(TimeGenerated, 5m), ProcessName, RansomwareTechnique
+| where Count > 2
+| extend Timestamp = Bin, RuleName = "AuditTeam Ransomware Generic Detection", MITRETechnique = RansomwareTechnique
+| project Timestamp, RuleName, MITRETechnique, ProcessName, Count, Computers, Accounts, CommandLines
+
+union (
+    Sysmon
+    | where EventID == 11 // File creation
+    | where TargetFilename endswith ".locked" or TargetFilename endswith ".encrypted" or TargetFilename endswith ".auditteam" or TargetFilename endswith ".ransom"
+    | extend RansomwareTechnique = "T1486 - Data Encrypted for Impact"
+    | summarize Count = count(), Computers = make_set(Computer), Files = make_set(TargetFilename) by Bin = bin(TimeGenerated, 5m), Image
+    | where Count > 10
+    | extend Timestamp = Bin, RuleName = "AuditTeam Ransomware File Encryption Detection", MITRETechnique = RansomwareTechnique
+    | project Timestamp, RuleName, MITRETechnique, Image, Count, Computers, Files
+)
+
+union (
+    SecurityEvent
+    | where EventID == 4663 // File access
+    | where AccessMask == 0x2 // Write access
+    | where ObjectName endswith ".locked" or ObjectName endswith ".encrypted" or ObjectName endswith ".auditteam" or ObjectName endswith ".ransom"
+    | extend RansomwareTechnique = "T1486 - Data Encrypted for Impact"
+    | summarize Count = count(), Computers = make_set(Computer), Files = make_set(ObjectName), Accounts = make_set(Account) by Bin = bin(TimeGenerated, 5m), ProcessName
+    | where Count > 20
+    | extend Timestamp = Bin, RuleName = "AuditTeam Ransomware Mass File Modification", MITRETechnique = RansomwareTechnique
+    | project Timestamp, RuleName, MITRETechnique, ProcessName, Count, Computers, Files, Accounts
+)
