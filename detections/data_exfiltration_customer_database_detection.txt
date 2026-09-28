@@ -1,0 +1,34 @@
+// Detect potential data exfiltration from customer databases
+// Looks for unusual large data transfers, abnormal query patterns, or access to sensitive tables
+let sensitiveTables = dynamic(["customers", "users", "profiles", "registration", "personal_info", "pii"]);
+let timeWindow = 1h;
+union withsource=SourceTable
+// Azure SQL Database audit logs
+AzureDiagnostics
+| where ResourceType == "SQLDATABASES" and Category == "SQLSecurityAuditEvents"
+| where TimeGenerated > ago(timeWindow)
+| extend query_s = tostring(parse_json(additionalProperties).statement),
+         rows_affected = toint(parse_json(additionalProperties).rows_affected),
+         data_bytes = tolong(parse_json(additionalProperties).data_bytes),
+         client_ip = tostring(parse_json(additionalProperties).client_ip),
+         principal_name = tostring(parse_json(additionalProperties).principal_name)
+| where rows_affected > 1000 or data_bytes > 10485760 // >10MB or >1000 rows
+| where query_s has_any (sensitiveTables)
+// Azure Storage / Blob access logs (if data staged there)
+| union (StorageBlobLogs
+| where TimeGenerated > ago(timeWindow)
+| where OperationName in ("ReadBlob", "DownloadBlob", "ListBlobs")
+| where ContentLength > 10485760 // >10MB
+| where BlobName has_any (sensitiveTables)
+)
+// Network flow logs for large egress from database subnets
+| union (AzureNetworkAnalytics_CL
+| where TimeGenerated > ago(timeWindow)
+| where FlowDirection_s == "Outbound"
+| where SourceSubnet_s in ("database-subnet", "db-subnet", "sql-subnet") // adjust to actual subnet names
+| where BytesSent_d > 10485760 // >10MB
+)
+| summarize EventCount = count(), TotalBytes = sum(data_bytes), TotalRows = sum(rows_affected) by bin(TimeGenerated, 15m), client_ip, principal_name, SourceTable
+| where EventCount > 5 or TotalBytes > 52428800 // >50MB in 15min
+| extend AccountCustomEntity = principal_name, IPCustomEntity = client_ip
+| project TimeGenerated, SourceTable, client_ip, principal_name, EventCount, TotalBytes, TotalRows
